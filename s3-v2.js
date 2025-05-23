@@ -1611,7 +1611,12 @@ async function decryptData(data) {
   });
   if (dataString !== marker) {
     logToConsole("info", "Data is not encrypted, returning as-is");
-    return JSON.parse(new TextDecoder().decode(data));
+    try {
+      return JSON.parse(new TextDecoder().decode(data));
+    } catch (error) {
+      logToConsole("warning", "Failed to parse unencrypted data as JSON, returning as string");
+      return new TextDecoder().decode(data);
+    }
   }
   if (!bucketName) {
     logToConsole("info", "Backup not configured, skipping decryption");
@@ -1645,7 +1650,14 @@ async function decryptData(data) {
     );
     const decryptedText = new TextDecoder().decode(decryptedContent);
     logToConsole("success", "Decryption successful");
-    return decryptedText;
+    
+    // Try to parse as JSON to maintain compatibility with version 1
+    try {
+      return JSON.parse(decryptedText);
+    } catch (jsonError) {
+      logToConsole("info", "Decrypted data is not valid JSON, returning as string");
+      return decryptedText;
+    }
   } catch (error) {
     logToConsole("error", "Decryption failed:", error);
     throw new Error(
