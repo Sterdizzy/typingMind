@@ -5117,11 +5117,13 @@ async function downloadCloudMetadata() {
     try {
       const data = await s3.getObject(params).promise();
       const content = data.Body;
-      const metadata = JSON.parse(
-        typeof content === "string"
-          ? content
-          : new TextDecoder().decode(content)
-      );
+      
+      // Decrypt the data first, then parse as JSON
+      const decryptedData = await decryptData(new Uint8Array(content));
+      const metadata = typeof decryptedData === 'string' 
+        ? JSON.parse(decryptedData) 
+        : decryptedData;
+      
       return metadata;
     } catch (error) {
       if (error.code === "NoSuchKey" || error.name === "NoSuchKey") {
