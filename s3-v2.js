@@ -1715,61 +1715,250 @@ async function performDailyBackup() {
   }
 }
 function exportBackupData() {
-  return new Promise((resolve, reject) => {
-    const exportData = {
-      localStorage: { ...localStorage },
-      indexedDB: {},
-    };
-    logToConsole("info", "Starting data export", {
-      localStorageKeys: Object.keys(exportData.localStorage).length,
+  return exportBackupDataInChunks();
+}
+// Calculate data size without stringifying the entire object
+function calculateDataSize(data) {
+  let size = 0;
+  
+  // Calculate localStorage size
+  if (data.localStorage) {
+    for (const [key, value] of Object.entries(data.localStorage)) {
+      size += key.length + (typeof value === 'string' ? value.length : JSON.stringify(value).length);
+    }
+  }
+  
+  // Calculate IndexedDB size (estimate)
+  if (data.indexedDB) {
+    for (const [key, value] of Object.entries(data.indexedDB)) {
+      size += key.length;
+      if (typeof value === 'string') {
+        size += value.length;
+      } else {
+        // For objects, estimate size more carefully
+        try {
+          const jsonStr = JSON.stringify(value);
+          size += jsonStr.length;
+        } catch (e) {
+          // If stringify fails, estimate based on object properties
+          size += estimateObjectSize(value);
+        }
+      }
+    }
+  }
+  
+  return size;
+}
+
+// Estimate object size without full stringification
+function estimateObjectSize(obj) {
+  if (typeof obj !== 'object' || obj === null) {
+    return String(obj).length;
+  }
+  
+  let size = 2; // For {}
+  let count = 0;
+  
+  for (const key in obj) {
+    if (obj.hasOwnProperty(key)) {
+      size += key.length + 3; // key + ":"
+      const value = obj[key];
+      
+      if (typeof value === 'string') {
+        size += value.length + 2; // quotes
+      } else if (typeof value === 'number' || typeof value === 'boolean') {
+        size += String(value).length;
+      } else if (Array.isArray(value)) {
+        size += 2; // []
+        size += value.length * 10; // rough estimate per item
+      } else if (typeof value === 'object') {
+        size += 50; // rough estimate for nested objects
+      }
+      
+      count++;
+      if (count > 1) size += 1; // comma
+    }
+  }
+  
+  return size;
+}
+
+// Export data in smaller chunks to avoid memory issues
+async function exportBackupDataInChunks() {
+  const exportData = {
+    localStorage: {},
+    indexedDB: {},
+  };
+
+  logToConsole("info", "Starting chunked data export");
+
+  // Export localStorage in smaller chunks
+  const localStorageKeys = Object.keys(localStorage);
+  logToConsole("info", `Processing ${localStorageKeys.length} localStorage keys`);
+  
+  for (const key of localStorageKeys) {
+    try {
+      exportData.localStorage[key] = localStorage.getItem(key);
+    } catch (error) {
+      logToConsole("warning", `Skipping localStorage key ${key} due to error:`, error);
+    }
+  }
+
+  // Export IndexedDB with better error handling
+  try {
+    const db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open("keyval-store", 1);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = (event) => resolve(event.target.result);
+      request.onupgradeneeded = (event) => {
+        const db = event.target.result;
+        if (!db.objectStoreNames.contains("keyval")) {
+          db.createObjectStore("keyval");
+        }
+      };
     });
-    const request = indexedDB.open("keyval-store", 1);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = function (event) {
-      const db = event.target.result;
-      const transaction = db.transaction(["keyval"], "readonly");
-      const store = transaction.objectStore("keyval");
-      const collectData = new Promise((resolveData) => {
-        store.getAllKeys().onsuccess = function (keyEvent) {
-          const keys = keyEvent.target.result;
-          logToConsole("info", "IndexedDB keys found", {
-            count: keys.length,
+
+    const transaction = db.transaction(["keyval"], "readonly");
+    const store = transaction.objectStore("keyval");
+    
+    // Get keys first
+    const keys = await new Promise((resolve, reject) => {
+      const request = store.getAllKeys();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    
+    logToConsole("info", `Processing ${keys.length} IndexedDB keys`);
+    
+    // Process keys in batches to avoid memory issues
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < keys.length; i += BATCH_SIZE) {
+      const batch = keys.slice(i, i + BATCH_SIZE);
+      
+      for (const key of batch) {
+        try {
+          const value = await new Promise((resolve, reject) => {
+            const request = store.get(key);
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
           });
-          store.getAll().onsuccess = function (valueEvent) {
-            const values = valueEvent.target.result;
-            keys.forEach((key, i) => {
-              exportData.indexedDB[key] = values[i];
-            });
-            resolveData();
-          };
-        };
-      });
-      Promise.all([
-        collectData,
-        new Promise((resolveTransaction) => {
-          transaction.oncomplete = resolveTransaction;
-        }),
-      ])
-        .then(() => {
-          const hasLocalStorageData =
-            Object.keys(exportData.localStorage).length > 0;
-          const hasIndexedDBData = Object.keys(exportData.indexedDB).length > 0;
-          logToConsole("info", "Export data summary", {
-            localStorageKeys: Object.keys(exportData.localStorage).length,
-            indexedDBKeys: Object.keys(exportData.indexedDB).length,
-            hasLocalStorageData,
-            hasIndexedDBData,
-          });
-          if (!hasLocalStorageData && !hasIndexedDBData) {
-            reject(new Error("No data found in localStorage or IndexedDB"));
-            return;
-          }
-          resolve(exportData);
-        })
-        .catch(reject);
-      transaction.onerror = () => reject(transaction.error);
-    };
+          
+          exportData.indexedDB[key] = value;
+        } catch (error) {
+          logToConsole("warning", `Skipping IndexedDB key ${key} due to error:`, error);
+        }
+      }
+      
+      // Small delay between batches to prevent blocking
+      if (i + BATCH_SIZE < keys.length) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+    
+    db.close();
+  } catch (error) {
+    logToConsole("error", "Error exporting IndexedDB data:", error);
+  }
+
+  logToConsole("info", "Chunked data export completed", {
+    localStorageKeys: Object.keys(exportData.localStorage).length,
+    indexedDBKeys: Object.keys(exportData.indexedDB).length,
   });
+
+  return exportData;
+}
+// Encrypt data in chunks to handle large datasets
+async function encryptDataInChunks(data) {
+  const encryptionKey = localStorage.getItem("encryption-key");
+  if (!encryptionKey) {
+    throw new Error("Encryption key not configured");
+  }
+
+  try {
+    // Try to serialize in chunks
+    let jsonString;
+    try {
+      // First try normal serialization
+      jsonString = JSON.stringify(data);
+    } catch (stringifyError) {
+      if (stringifyError.message.includes("Invalid string length")) {
+        // If too large, serialize in parts
+        logToConsole("info", "Data too large for direct serialization, using chunked approach");
+        
+        const parts = [];
+        parts.push('{"localStorage":');
+        parts.push(JSON.stringify(data.localStorage || {}));
+        parts.push(',"indexedDB":');
+        parts.push(JSON.stringify(data.indexedDB || {}));
+        parts.push('}');
+        
+        jsonString = parts.join('');
+      } else {
+        throw stringifyError;
+      }
+    }
+
+    const key = await deriveKey(encryptionKey);
+    const enc = new TextEncoder();
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    
+    // Encrypt in chunks if the string is very large
+    const MAX_CHUNK_SIZE = 50 * 1024 * 1024; // 50MB chunks
+    
+    if (jsonString.length > MAX_CHUNK_SIZE) {
+      logToConsole("info", "Using chunked encryption for large data");
+      
+      const chunks = [];
+      for (let i = 0; i < jsonString.length; i += MAX_CHUNK_SIZE) {
+        const chunk = jsonString.slice(i, i + MAX_CHUNK_SIZE);
+        const encodedChunk = enc.encode(chunk);
+        const encryptedChunk = await window.crypto.subtle.encrypt(
+          { name: "AES-GCM", iv: iv },
+          key,
+          encodedChunk
+        );
+        chunks.push(new Uint8Array(encryptedChunk));
+      }
+      
+      // Combine chunks
+      const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const combined = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.length;
+      }
+      
+      const marker = new TextEncoder().encode("ENCRYPTED:");
+      const combinedData = new Uint8Array(marker.length + iv.length + combined.length);
+      combinedData.set(marker);
+      combinedData.set(iv, marker.length);
+      combinedData.set(combined, marker.length + iv.length);
+      
+      return combinedData;
+    } else {
+      // Normal encryption for smaller data
+      const encodedData = enc.encode(jsonString);
+      const encryptedContent = await window.crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: iv },
+        key,
+        encodedData
+      );
+      
+      const marker = new TextEncoder().encode("ENCRYPTED:");
+      const combinedData = new Uint8Array(
+        marker.length + iv.length + encryptedContent.byteLength
+      );
+      combinedData.set(marker);
+      combinedData.set(iv, marker.length);
+      combinedData.set(new Uint8Array(encryptedContent), marker.length + iv.length);
+      
+      return combinedData;
+    }
+  } catch (error) {
+    logToConsole("error", "Chunked encryption failed:", error);
+    throw error;
+  }
 }
 async function createDailyBackup(key, data) {
   logToConsole("start", `Creating daily backup: ${key}`);
@@ -2395,7 +2584,7 @@ function startSyncInterval() {
         }
       } else if (config.syncMode === "backup" && hasLocalChanges) {
         logToConsole("info", "Local changes detected - backing up to cloud");
-        queueOperation("backup-modified-chats", syncToCloud);
+        queueOperation("backup-modified-chats", syncToCloud, [], 120000); // Increased timeout to 120 seconds for chunked processing
       }
     } catch (error) {
       logToConsole("error", "Error in sync interval:", error);
