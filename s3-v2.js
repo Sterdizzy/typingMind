@@ -2019,7 +2019,10 @@ async function createSnapshot(name) {
     logToConsole("info", "Loading JSZip...");
     await loadJSZip();
     logToConsole("success", "JSZip loaded successfully");
-    const data = await exportBackupData();
+
+    // Get data in smaller chunks to avoid memory issues
+    const data = await exportBackupDataInChunks();
+    
     const now = new Date();
     const timestamp =
       now.getFullYear().toString() +
@@ -2030,7 +2033,9 @@ async function createSnapshot(name) {
       now.getSeconds().toString().padStart(2, "0") +
       now.getMilliseconds().toString().padStart(3, "0");
     const key = `s-${name}-${timestamp}.zip`;
+    
     logToConsole("info", `Creating snapshot with key: ${key}`);
+    
     const encryptionKey = localStorage.getItem("encryption-key");
     if (!encryptionKey) {
       logToConsole(
@@ -2039,10 +2044,21 @@ async function createSnapshot(name) {
       );
       return false;
     }
-    const rawSize = new Blob([JSON.stringify(data)]).size;
-    logToConsole("info", `Raw data size: ${formatFileSize(rawSize)}`);
+
+    // Calculate size more carefully
+    let rawSize = 0;
+    try {
+      // Calculate size without creating the full string
+      rawSize = calculateDataSize(data);
+      logToConsole("info", `Estimated raw data size: ${formatFileSize(rawSize)}`);
+    } catch (sizeError) {
+      logToConsole("warning", "Could not calculate exact size, proceeding with chunked approach");
+      rawSize = 0; // Will be calculated during processing
+    }
+
     logToConsole("info", "Encrypting snapshot data...");
-    const encryptedData = await encryptData(data);
+    const encryptedData = await encryptDataInChunks(data);
+    
     const zip = new JSZip();
     const jsonFileName = key.replace(".zip", ".json");
     zip.file(jsonFileName, encryptedData, {
@@ -2052,21 +2068,30 @@ async function createSnapshot(name) {
       },
       binary: true,
     });
-    const compressedContent = await zip.generateAsync({ type: "blob" });
+    
+    const compressedContent = await zip.generateAsync({ 
+      type: "blob",
+      streamFiles: true // Use streaming for large files
+    });
+    
     if (compressedContent.size < 100) {
       throw new Error("Snapshot file is too small or empty. Upload cancelled.");
     }
+    
     const arrayBuffer = await compressedContent.arrayBuffer();
     const content = new Uint8Array(arrayBuffer);
+    
     const uploadMetadata = {
       version: EXTENSION_VERSION,
       timestamp: String(Date.now()),
       type: "snapshot",
-      originalSize: String(rawSize),
+      originalSize: String(rawSize || encryptedData.length),
       compressedSize: String(compressedContent.size),
       encrypted: "true",
     };
+    
     await uploadToS3(key, content, uploadMetadata);
+    
     backupState.lastManualSnapshot = Date.now();
     await loadBackupList();
     logToConsole("success", "Snapshot created successfully");
